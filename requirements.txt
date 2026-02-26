@@ -1,4 +1,8 @@
 certifi==2026.2.25
+matplotlib>=3.7
+networkx>=3.0
+pyvis>=0.3.2
+plotly>=5.0
 charset-normalizer==3.4.4
 idna==3.11
 joblib==1.5.3

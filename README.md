@@ -1,29 +1,30 @@
-Small project to find related papers using some API's. Will make an actual readme soon.
-Generated with Claude
-
-Current AI generated README:
-
 # Literature Explorer
 
-A two-script toolkit for discovering research papers you may have missed, given a reading list you already have. Built around the Semantic Scholar and OpenAlex APIs — both free, no API key needed.
+Discover research papers you may have missed, starting from a `.bib` file or folder of PDFs. Built on Semantic Scholar and OpenAlex — both free, no API key required.
 
 ---
 
-## Files
+## Structure
 
-| File | Purpose |
-|------|---------|
-| `literature_explorer.py` | Main tool — takes your `.bib` file or a folder of PDFs, finds related papers you haven't read, and outputs a ranked report + BibTeX file |
-| `cache_search.py` | Companion search tool — lets you query the cache that `literature_explorer` builds up over time |
+```
+core/
+  explorer.py   — resolve corpus, build co-citation graph, score & cluster candidates
+  search.py     — search and filter the cache interactively
+  enrich.py     — fill in missing abstracts via OpenAlex / CrossRef
+  viz.py        — generate interactive visualizations
+run.py          — one-command pipeline (explore → enrich → visualize)
+pipeline.ipynb  — step-by-step Jupyter notebook
+requirements.txt
+```
 
 ---
 
 ## Installation
 
-Python 3.8+ required.
+Python 3.9+ required.
 
 ```bash
-pip install requests scikit-learn
+pip install -r requirements.txt
 
 # Only needed if using --pdf-dir
 pip install pypdf
@@ -31,175 +32,229 @@ pip install pypdf
 
 ---
 
-## literature_explorer.py
-
-### What it does
-
-1. Parses your corpus from a `.bib` file or a folder of PDFs
-2. Resolves each paper via Semantic Scholar (with OpenAlex as fallback), fetching metadata, references, and citations in a single API call per paper
-3. Builds a co-citation graph — papers that appear repeatedly in the reference lists or citation lists of your corpus are strong candidates
-4. Scores candidates on co-citation strength, citation count, recency, and field relevance (psychology, sociology, social science, education, communication, public health, medicine, neuroscience all get a boost)
-5. Optionally re-weights scores toward a keyword focus (e.g. if you're pivoting from reproducibility to data availability)
-6. Outputs a Markdown report split into **Core** (papers you likely missed that are foundational) and **Periphery** (adjacent, interesting work), plus a `.bib` file of all recommendations
-
-### Basic usage
+## Quick start
 
 ```bash
-# From a BibTeX file
-python literature_explorer.py --bib references.bib
+# Run the full pipeline (explore → enrich abstracts → visualize)
+python run.py --bib references.bib
 
-# From a folder of PDFs
-python literature_explorer.py --pdf-dir ~/papers/
+# With keyword focus and clustering
+python run.py --bib references.bib --keywords "open data" "data sharing" --cluster 0
 
-# Specify output folder
-python literature_explorer.py --bib references.bib --out ./results
+# Use a scoring preset
+python run.py --bib references.bib --preset recent
 ```
 
-### Keyword focus
+Outputs go to `outputs/{project_name}/`. The cache is saved next to the `.bib` file as `{name}_cache.json`.
 
-If you want to pivot your search toward a specific topic, pass keywords with `--keywords`. The scorer will up-weight papers whose titles and abstracts are relevant to those terms — using both exact matching and TF-IDF semantic proximity, so synonyms are also caught.
+---
+
+## How it works
+
+1. **Parse** your corpus from a `.bib` file or PDF folder
+2. **Resolve** each paper via Semantic Scholar (OpenAlex fallback), fetching metadata + full reference/citation lists in one API call per paper
+3. **Build** a co-citation graph — papers that recur across your corpus's reference and citation lists are strong candidates
+4. **Score** candidates on co-citation frequency, citation count, recency, and field relevance
+5. **Cluster** candidates into topic groups using TF-IDF + KMeans (optional)
+6. **Output** a Markdown report split into Core and Periphery, a `.bib` file, and interactive visualizations
+
+---
+
+## `run.py` — full pipeline
 
 ```bash
-# Focus on data availability (also catches "open data", "data sharing", etc.)
-python literature_explorer.py --bib references.bib \
-  --keywords "data availability" "open data" "data sharing"
-
-# Pivot back to reproducibility
-python literature_explorer.py --bib references.bib \
-  --keywords "reproducibility" "replication" "computational reproducibility"
-
-# No keywords = neutral co-citation ranking
-python literature_explorer.py --bib references.bib
+python run.py --bib references.bib [options]
 ```
 
-When keywords are active, the scoring blend shifts from `80% base / 20% similarity` to `60% base / 15% similarity / 25% keyword relevance`. The report header shows which keywords were used.
+| Option | Description |
+|--------|-------------|
+| `--bib FILE` | Path to `.bib` file |
+| `--pdf-dir DIR` | Path to folder of PDFs (alternative to `--bib`) |
+| `--out DIR` | Output root directory (default: `outputs/`) |
+| `--keywords KW ...` | Focus keywords to re-weight scoring |
+| `--preset` | Scoring preset: `balanced` (default), `highly-cited`, `recent`, `interdisciplinary` |
+| `--cluster N` | Cluster candidates into N topic groups; `0` = auto-detect best k |
+| `--top N` | Top N candidates in visualizations (default: 50) |
+| `--no-viz` | Skip visualization step |
+| `--dry-run` | Skip abstract enrichment API calls |
 
-### Caching
+---
 
-Every paper resolved from the API is saved to `literature_explorer_cache.json`. On subsequent runs, cached papers are loaded instantly with no API calls. The cache stores metadata, full reference lists, and citation lists together, so the co-citation graph step is always instant after the first run.
+## `core/explorer.py` — explore
+
+Resolves your corpus and produces ranked recommendations.
 
 ```bash
-# Use a custom cache location (useful if working across multiple projects)
-python literature_explorer.py --bib references.bib --cache ~/research/my_cache.json
+python -m core.explorer --bib references.bib
+python -m core.explorer --bib references.bib --keywords "replication" --preset recent
+python -m core.explorer --bib references.bib --cluster 5
 ```
 
-If you interrupt a run, progress is saved periodically — the next run will pick up where it left off for already-resolved papers.
+### Scoring presets
 
-### All options
+| Preset | co-cite | citations | recency | field |
+|--------|---------|-----------|---------|-------|
+| `balanced` (default) | 35% | 30% | 20% | 15% |
+| `highly-cited` | 20% | 60% | 10% | 10% |
+| `recent` | 25% | 15% | 50% | 10% |
+| `interdisciplinary` | 35% | 25% | 15% | 25% |
+
+### Clustering (`--cluster`)
+
+Groups the top candidate papers into topic clusters using TF-IDF + KMeans on their abstracts. Each cluster is described by its top 5 terms and top 3 papers by score.
+
+- `--cluster 0` — auto-detect the best number of clusters (via silhouette score, k in 2–8)
+- `--cluster 5` — explicitly request 5 clusters
+
+When clustering is active, the co-citation network colours nodes by cluster instead of score quartile, and a **Topic Clusters** section is appended to the Markdown report.
+
+### Options
 
 ```
 --bib FILE          Path to .bib file
---pdf-dir DIR       Path to folder of PDFs (alternative to --bib)
---out DIR           Output directory for report and .bib (default: current dir)
---cache FILE        Cache file path (default: literature_explorer_cache.json)
---keywords KW ...   One or more focus keywords to re-weight scoring
-```
-
-### Output files
-
-| File | Contents |
-|------|---------|
-| `literature_report.md` | Ranked recommendations split into Core and Periphery sections, with authors, citation counts, co-citation counts, field tags, and abstract snippets |
-| `literature_recommendations.bib` | BibTeX entries for all recommended papers, ready to import into Zotero or any reference manager |
-
----
-
-## cache_search.py
-
-### What it does
-
-As `literature_explorer` runs over time, it builds up a large cache of papers — not just your corpus, but every paper that appeared in any reference or citation list it fetched. This can easily grow to 5,000–10,000 papers. `cache_search.py` lets you search and explore that pool without running the full pipeline again.
-
-### Basic usage
-
-```bash
-# Search by keyword
-python cache_search.py "data availability"
-
-# Multiple keywords (matches any by default)
-python cache_search.py "data availability" "open data" "data sharing"
-
-# Require all keywords to be present
-python cache_search.py "data" "reproducibility" --mode all
-
-# Show cache statistics (paper count, field breakdown, year distribution)
-python cache_search.py --stats
-```
-
-### Filtering and sorting
-
-```bash
-# Filter by field of study
-python cache_search.py "open science" --field psychology
-
-# Filter by year range
-python cache_search.py "preregistration" --year-min 2015 --year-max 2022
-
-# Sort by citation count instead of relevance
-python cache_search.py "open data" --sort citations
-
-# Sort by publication year (newest first)
-python cache_search.py "replication" --sort year
-
-# Show more results
-python cache_search.py "transparency" --top 50
-```
-
-### Inspecting results
-
-```bash
-# Show abstract snippets with keyword hits highlighted in [brackets]
-python cache_search.py "data sharing" --verbose
-```
-
-### Exporting
-
-```bash
-# Export search results to a .bib file
-python cache_search.py "data availability" --top 50 --export data_availability.bib
-```
-
-### All options
-
-```
-keywords            Keywords to search for (positional, space or quote-separated)
---cache FILE        Cache file to search (default: literature_explorer_cache.json)
---top N             Max results to show (default: 30)
---sort              Sort by: relevance (default), citations, year
---mode              Match any keyword (default) or require all
---field FIELD       Filter by field of study
---year-min YEAR     Only papers from this year onward
---year-max YEAR     Only papers up to this year
---verbose           Show abstract snippets with keyword hits highlighted
---export FILE       Export results as a .bib file
---stats             Show cache statistics
+--pdf-dir DIR       Folder of PDFs (alternative to --bib)
+--out DIR           Output directory (default: outputs/)
+--cache FILE        Cache file path (auto-derived from bib name by default)
+--keywords KW ...   Focus keywords to re-weight scoring
+--preset NAME       Scoring weight preset (balanced / highly-cited / recent / interdisciplinary)
+--cluster N         Cluster candidates (0 = auto k, N > 1 = explicit k, omit = skip)
 ```
 
 ---
 
-## Typical workflow
+## `core/search.py` — search the cache
+
+Search and filter the full paper pool (corpus + all referenced/citing papers) without re-running the pipeline.
 
 ```bash
-# First run — resolves all papers and builds the cache (takes a few minutes)
-python literature_explorer.py --bib references.bib --out results/
+python -m core.search --cache references_cache.json "data availability"
+python -m core.search --cache references_cache.json "open science" --sort trending
+python -m core.search --cache references_cache.json --type meta-analysis --field psychology
+python -m core.search --cache references_cache.json --semantic "open science reform"
+python -m core.search --cache references_cache.json --stats
+```
 
-# Pivot to a new topic — instant, uses the cache
-python literature_explorer.py --bib references.bib \
-  --keywords "data availability" --out results/data_availability/
+### Filters
 
-# Search the cache directly for something specific
-python cache_search.py "data availability" --field psychology --sort citations
+| Option | Description |
+|--------|-------------|
+| `keywords` | Keyword search (positional). Quote phrases: `'"data availability"'` |
+| `--mode any\|all` | Match any keyword (default) or require all |
+| `--search-in all\|title\|abstract` | Which field to search |
+| `--regex` | Treat keywords as regular expressions |
+| `--field FIELD` | Filter by field of study (substring) |
+| `--author NAME` | Filter by author name (substring) |
+| `--year-min / --year-max` | Publication year range |
+| `--min-citations / --max-citations` | Citation count range |
+| `--venue VENUE` | Filter by journal/venue name (substring) |
+| `--type TYPE` | Heuristic paper type: `review`, `meta-analysis`, `empirical`, `methods`, `theoretical`, `replication` |
+| `--new-only` | Exclude your original corpus papers — only show discovered candidates |
+| `--exclude TERM ...` | Drop papers containing any of these terms |
 
-# Add new papers to your bib and re-run — only the new ones hit the API
-python literature_explorer.py --bib references_v2.bib --out results/v2/
+### Sorting
+
+```bash
+--sort relevance   # keyword match score (default)
+--sort citations   # total citation count
+--sort year        # newest first
+--sort trending    # citation velocity = citations / years since publication
+```
+
+### Semantic search
+
+```bash
+# Find papers conceptually related to a query (TF-IDF cosine similarity)
+--semantic "open science reform practices"
+
+# Find papers similar to a specific paper already in the cache
+--semantic-like "The Role of Preregistration in Psychology"
+```
+
+### Export
+
+```bash
+--export results.bib                          # BibTeX (default)
+--export results.csv --export-format csv      # CSV with title/authors/doi/abstract
+--export results.ris --export-format ris      # RIS (Endnote/Mendeley/Zotero)
+--export notes/ --export-format obsidian      # Markdown notes, one file per paper
 ```
 
 ---
 
-## Notes on API rate limits
+## `core/enrich.py` — fill missing abstracts
 
-Semantic Scholar allows roughly 100 requests per minute without an API key. The script sleeps ~1.1 seconds between calls and backs off automatically when rate limited. With a warm cache, subsequent runs make very few or zero API calls. If you have a Semantic Scholar API key, you can increase the `SLEEP` constant at the top of `literature_explorer.py` to a lower value.
+Fetches missing abstracts for papers in the cache via Semantic Scholar batch API, then OpenAlex, then CrossRef.
 
-## Notes on OpenAlex fallback
+```bash
+python -m core.enrich --cache references_cache.json
+python -m core.enrich --cache references_cache.json --dry-run   # preview only
+python -m core.enrich --cache references_cache.json --limit 50  # cap API calls
+```
 
-When a paper cannot be resolved via Semantic Scholar (e.g. due to rate limits or a missing record), the script tries OpenAlex. OpenAlex-resolved papers are included in your corpus identity set so they're excluded from recommendations, but they don't contribute to the co-citation graph since OpenAlex doesn't expose full reference lists in the same way. These are marked `(OA)` in the resolution log.
+---
+
+## `core/viz.py` — visualizations
+
+Generates four interactive outputs from the cache:
+
+```bash
+python -m core.viz --cache references_cache.json
+python -m core.viz --cache references_cache.json --top 80 --no-table
+```
+
+| Output | Format | Description |
+|--------|--------|-------------|
+| `{proj}_network_{date}.html` | HTML | Force-directed co-citation network (pyvis). Corpus = blue dots, candidates = coloured squares. Colours by cluster if clustering was run, otherwise by score quartile. |
+| `{proj}_timeline_{date}.html` | HTML | Interactive year × citation scatter (Plotly). Hover for abstract snippet; click to open DOI. |
+| `{proj}_fields_{date}.png` | PNG | Field distribution bar chart. Green = overlap with your corpus. |
+| `{proj}_scores_{date}.html` | HTML | Score breakdown table (Plotly). Columns: rank, title (clickable), year, score, co-citations, citations, cluster. Cells colour-coded by value. Includes CSV export button. |
+
+Options:
+```
+--top N          Top N candidates (default: 50)
+--no-network     Skip network
+--no-timeline    Skip timeline
+--no-fields      Skip field chart
+--no-table       Skip score breakdown table
+```
+
+---
+
+## `pipeline.ipynb` — Jupyter notebook
+
+Step-by-step notebook. Set `BIB_FILE`, `KEYWORDS`, `PRESET`, `CLUSTER` in the config cell and run each step individually.
+
+New cells for advanced search: type filter, semantic search, trending sort, venue filter, new-only mode, exclude terms.
+
+---
+
+## Caching
+
+Each project gets its own cache file next to the `.bib` file: `{name}_cache.json`. On subsequent runs, cached papers are loaded instantly. If you interrupt a run, resolved papers are already saved — the next run skips them.
+
+Running with a warm cache still re-runs graph building, scoring, and clustering (fast, in-memory). Only the Semantic Scholar API calls are skipped.
+
+---
+
+## Output layout
+
+```
+outputs/
+  {project_name}/
+    {project_name}_report_{date}.md
+    {project_name}_recommendations_{date}.bib
+    {project_name}_network_{date}.html
+    {project_name}_timeline_{date}.html
+    {project_name}_fields_{date}.png
+    {project_name}_scores_{date}.html
+```
+
+---
+
+## API notes
+
+**Semantic Scholar**: ~100 requests/minute without a key. The script sleeps 1.1s between calls and backs off on rate limits. With a warm cache, subsequent runs make zero calls.
+
+**OpenAlex**: Used as fallback when SS fails, and for batch abstract enrichment. No key needed; polite pool is used automatically.
+
+**CrossRef**: Last-resort abstract fallback in `enrich.py`.
