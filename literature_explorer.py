@@ -19,10 +19,10 @@ except ImportError:
     sys.exit("Missing dependency: pip install requests")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-SS_BASE    = "https://api.semanticscholar.org/graph/v1/paper"
-OA_BASE    = "https://api.openalex.org/works"
-SLEEP      = 1.1
-CACHE_FILE = Path("literature_explorer_cache.json")
+SS_BASE           = "https://api.semanticscholar.org/graph/v1/paper"
+OA_BASE           = "https://api.openalex.org/works"
+SLEEP             = 1.1
+DEFAULT_CACHE     = Path("literature_explorer_cache.json")
 
 # Fetch metadata + references + citations in ONE call per paper
 SS_FIELDS = (
@@ -39,41 +39,53 @@ BONUS_FIELDS = {
 }
 
 # ── Cache ──────────────────────────────────────────────────────────────────────
-def load_cache():
-    if CACHE_FILE.exists():
+def load_cache(cache_path):
+    cache_path = Path(cache_path)
+    if cache_path.exists():
         try:
-            data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
             n = len(data.get("papers", {}))
             print(f"  📦 Cache loaded: {n} papers already resolved")
             return data
         except Exception:
             print("  ⚠  Cache corrupted — starting fresh")
     else:
-        print(f"  No cache yet — will create {CACHE_FILE.name}")
+        print(f"  No cache yet — will create {cache_path.name}")
     return {"papers": {}}
 
-def save_cache(cache):
-    CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+def save_cache(cache, cache_path):
+    Path(cache_path).write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # ── Step 1: Parse corpus ───────────────────────────────────────────────────────
+def _bib_field(pattern, entry):
+    """
+    Extract a BibTeX field value that may be delimited by {…} (possibly with
+    one level of nested braces) or by "…".  Returns the cleaned string or None.
+    """
+    # Matches:  field = { content {nested} content }  OR  field = "content"
+    pat = re.compile(
+        pattern + r'\s*=\s*(?:\{((?:[^{}]|\{[^{}]*\})*)\}|"([^"]*)")',
+        re.IGNORECASE | re.DOTALL,
+    )
+    m = pat.search(entry)
+    if not m:
+        return None
+    raw = (m.group(1) if m.group(1) is not None else m.group(2)) or ""
+    # Strip any remaining inner braces used for capitalisation, e.g. {R}eplication
+    return re.sub(r'\{([^}]*)\}', r'\1', raw).strip()
+
 def parse_bib(bib_path):
     text = Path(bib_path).read_text(encoding="utf-8", errors="ignore")
-    doi_pat   = re.compile(r'doi\s*=\s*\{([^}]+)\}', re.IGNORECASE)
-    title_pat = re.compile(r'title\s*=\s*\{([^}]+)\}', re.IGNORECASE)
-    year_pat  = re.compile(r'year\s*=\s*\{([^}]+)\}', re.IGNORECASE)
     papers = []
     for entry in re.split(r'(?=@\w+\{)', text):
-        doi_m   = doi_pat.search(entry)
-        title_m = title_pat.search(entry)
-        year_m  = year_pat.search(entry)
-        doi = doi_m.group(1).strip().replace("https://doi.org/", "").rstrip("}") if doi_m else None
-        if doi and not doi.startswith("10."):
-            doi = None
-        papers.append({
-            "title": title_m.group(1).strip() if title_m else "",
-            "doi":   doi,
-            "year":  year_m.group(1).strip() if year_m else "",
-        })
+        title = _bib_field("title", entry) or ""
+        year  = _bib_field("year",  entry) or ""
+        doi   = _bib_field("doi",   entry)
+        if doi:
+            doi = doi.replace("https://doi.org/", "").strip().rstrip(".,)")
+            if not doi.startswith("10."):
+                doi = None
+        papers.append({"title": title, "doi": doi, "year": year})
     return [p for p in papers if p["title"] or p["doi"]]
 
 def parse_pdf_dir(pdf_dir):
@@ -166,7 +178,7 @@ def _oa_to_ss(oa):
     }
 
 # ── Step 3: Resolve corpus (metadata + refs + citations in ONE call each) ──────
-def resolve_all(corpus, cache):
+def resolve_all(corpus, cache, cache_path):
     """
     Resolves every corpus paper via a single Semantic Scholar request that
     returns metadata + full reference list + citation list together.
@@ -220,9 +232,31 @@ def resolve_all(corpus, cache):
                 failed.append(paper)
                 continue
 
+        # If SS returned 0 references, try the dedicated /references endpoint.
+        # This happens for some papers where the inline field is restricted.
+        if not result.get("_source") and not result.get("references"):
+            pid_ss = result.get("paperId")
+            if pid_ss:
+                ref_fields = ("paperId,title,year,citationCount,"
+                              "authors,externalIds,fieldsOfStudy")
+                ref_data = ss_get(
+                    f"{SS_BASE}/{pid_ss}/references",
+                    {"fields": ref_fields, "limit": 500},
+                )
+                api_calls += 1
+                time.sleep(SLEEP)
+                if ref_data and ref_data.get("data"):
+                    result["references"] = [
+                        r["citedPaper"] for r in ref_data["data"]
+                        if r.get("citedPaper")
+                    ]
+                    print(f"    ↳ fetched {len(result['references'])} refs via /references endpoint")
+                else:
+                    print(f"    ↳ /references endpoint returned nothing — SS has no ref data for this paper")
+
         resolved.append(result)
         cache["papers"][cache_key] = result
-        save_cache(cache)
+        save_cache(cache, cache_path)
 
         src    = " (OA)" if result.get("_source") == "openalex" else ""
         refs_n = len(result.get("references") or [])
@@ -461,7 +495,7 @@ def main():
     parser = argparse.ArgumentParser(description="Literature Explorer — find papers you missed")
     parser.add_argument("--bib",     help="Path to .bib file")
     parser.add_argument("--pdf-dir", help="Path to folder of PDFs")
-    parser.add_argument("--out",     default=".", help="Output directory (default: current dir)")
+    parser.add_argument("--out",     default="outputs", help="Output directory (default: outputs/)")
     parser.add_argument("--cache",   default="literature_explorer_cache.json",
                         help="Cache file path (default: literature_explorer_cache.json)")
     parser.add_argument("--keywords", nargs="+", metavar="KEYWORD",
@@ -472,8 +506,7 @@ def main():
     if not args.bib and not args.pdf_dir:
         parser.error("Provide --bib or --pdf-dir")
 
-    global CACHE_FILE
-    CACHE_FILE = Path(args.cache)
+    cache_path = Path(args.cache)
     out_dir    = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -484,10 +517,10 @@ def main():
 
     # 2. Cache
     print("\n📦 Loading cache...")
-    cache = load_cache()
+    cache = load_cache(cache_path)
 
     # 3. Resolve — one API call per paper, gets everything at once
-    resolved_corpus = resolve_all(corpus, cache)
+    resolved_corpus = resolve_all(corpus, cache, cache_path)
     corpus_ids = {p["paperId"] for p in resolved_corpus if p.get("paperId")}
 
     # 4. Graph — pure in-memory, zero API calls
@@ -545,8 +578,8 @@ def main():
     )
     bib_text = "\n\n".join(to_bibtex(m) for _, _, m in final_scored)
 
-    report_path = out_dir / "literature_report.md"
-    bib_path    = out_dir / "literature_recommendations.bib"
+    report_path = out_dir / f"literature_report_{today}.md"
+    bib_path    = out_dir / f"literature_recommendations_{today}.bib"
     report_path.write_text(report_md, encoding="utf-8")
     bib_path.write_text(bib_text, encoding="utf-8")
 

@@ -248,7 +248,7 @@ def main():
     parser.add_argument("--verbose",  action="store_true",
                         help="Show abstract snippets with hits highlighted")
     parser.add_argument("--export",   metavar="FILE",
-                        help="Export results to a .bib file")
+                        help="Export results to a .bib file (default dir: outputs/)")
     parser.add_argument("--stats",    action="store_true",
                         help="Show cache statistics and exit")
     args = parser.parse_args()
@@ -298,6 +298,10 @@ def main():
 
     if args.export:
         bib_path = Path(args.export)
+        # If only a bare filename (no parent dir), place it in outputs/
+        if bib_path.parent == Path("."):
+            bib_path = Path("outputs") / bib_path
+        bib_path.parent.mkdir(parents=True, exist_ok=True)
         bib_text = "\n\n".join(to_bibtex(p) for _, _, p in results)
         bib_path.write_text(bib_text, encoding="utf-8")
         print(f"\n  📚 Exported {len(results)} entries → {bib_path}")
