@@ -1,0 +1,9 @@
+.claude
+.venv
+outputs/
+.DS_Store
+
+*.json
+*.bib
+
+old/
