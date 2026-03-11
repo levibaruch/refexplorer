@@ -131,45 +131,24 @@ def _node_size(citations, lo=10, hi=40):
     log_hi = math.log1p(5000)  # ~saturates at 5000 citations
     return lo + (hi - lo) * min(log_c / log_hi, 1.0)
 
-# ── Visualization 1: Interactive co-citation network (HTML) ───────────────────
+# ── Visualization 1: Interactive co-citation network (HTML via cosmos.gl) ─────
 def make_network(corpus_ids, cocit_count, all_papers, candidates, out_path):
-    pyvis = _require("pyvis", "pyvis")
-    Network = pyvis.network.Network
-
-    net = Network(
-        height="820px", width="100%",
-        bgcolor="#1a1a2e", font_color="white",
-        directed=False,
-        notebook=False,
-    )
-    net.set_options("""
-    {
-      "physics": {
-        "forceAtlas2Based": {
-          "gravitationalConstant": -60,
-          "centralGravity": 0.003,
-          "springLength": 120,
-          "springConstant": 0.08
-        },
-        "solver": "forceAtlas2Based",
-        "stabilization": {"iterations": 150}
-      },
-      "interaction": {"hover": true, "navigationButtons": true},
-      "edges": {"smooth": {"type": "continuous"}, "color": {"opacity": 0.5}}
-    }
-    """)
-
+    """GPU-accelerated graph using @cosmos.gl/graph (WebGL). No pyvis needed."""
     candidate_pids = {pid for pid, _, _ in candidates}
     max_score      = candidates[0][1] if candidates else 1.0
+    cand_score     = {pid: sc for pid, sc, _ in candidates}
 
-    # 8-colour cluster palette
     _CLUSTER_PALETTE = [
         "#e63946", "#f4a261", "#2a9d8f", "#a8dadc",
         "#a786c9", "#f7c59f", "#43aa8b", "#f9c74f",
     ]
+    has_clusters = any(all_papers.get(pid, {}).get("_cluster") is not None
+                       for pid, _, _ in candidates)
 
-    def _candidate_colour(score, cluster=None):
-        if cluster is not None:
+    def _node_color(kind, score, cluster=None):
+        if kind == "corpus":
+            return "#4cc9f0"
+        if cluster is not None and has_clusters:
             return _CLUSTER_PALETTE[cluster % len(_CLUSTER_PALETTE)]
         q = score / max(max_score, 1e-9)
         if q >= 0.75: return "#e63946"
@@ -177,83 +156,427 @@ def make_network(corpus_ids, cocit_count, all_papers, candidates, out_path):
         if q >= 0.25: return "#2a9d8f"
         return "#a8dadc"
 
-    has_clusters = any(all_papers.get(pid, {}).get("_cluster") is not None
-                       for pid, _, _ in candidates)
+    # ── Node list ──────────────────────────────────────────────────────────
+    node_list = []
+    node_idx  = {}
+    added     = set()
 
-    added_nodes = set()
-
-    def add_corpus_node(pid, paper):
-        if pid in added_nodes:
+    def add_node(pid, paper, kind, score=0.0):
+        if pid in added:
             return
-        cites = paper.get("citationCount") or 0
-        size  = _node_size(cites, lo=12, hi=35)
-        label = _short_title(paper, 30)
-        tip   = (f"<b>{paper.get('title','')}</b><br>"
-                 f"Year: {paper.get('year','?')}<br>"
-                 f"Author: {_first_author(paper)}<br>"
-                 f"Citations: {cites}<br>"
-                 f"<i>[CORPUS]</i>")
-        net.add_node(pid, label=label, title=tip,
-                     color="#4cc9f0", size=size, shape="dot",
-                     borderWidth=2, borderWidthSelected=4)
-        added_nodes.add(pid)
-
-    def add_candidate_node(pid, score, paper):
-        if pid in added_nodes:
-            return
+        added.add(pid)
         cites   = paper.get("citationCount") or 0
         cc      = cocit_count.get(pid, 0)
+        doi     = (paper.get("externalIds") or {}).get("DOI", "")
         cluster = paper.get("_cluster")
-        size    = _node_size(cites, lo=8, hi=30)
-        label   = _short_title(paper, 30)
-        cluster_tag = f"<br>Cluster: {cluster+1}" if cluster is not None else ""
-        tip   = (f"<b>{paper.get('title','')}</b><br>"
-                 f"Year: {paper.get('year','?')}<br>"
-                 f"Author: {_first_author(paper)}<br>"
-                 f"Citations: {cites}<br>"
-                 f"Co-citations: {cc}<br>"
-                 f"Score: {score:.3f}{cluster_tag}")
-        colour = _candidate_colour(score, cluster if has_clusters else None)
-        net.add_node(pid, label=label, title=tip,
-                     color=colour, size=size, shape="square",
-                     borderWidth=1)
-        added_nodes.add(pid)
+        size    = max(1, min(6, 1 + 5 * math.log1p(cites) / math.log1p(5000)))
+        node_idx[pid] = len(node_list)
+        node_list.append({
+            "title":       paper.get("title", "(no title)"),
+            "year":        paper.get("year", ""),
+            "author":      _first_author(paper),
+            "citations":   cites,
+            "coCitations": cc,
+            "score":       round(score, 3),
+            "doi":         doi,
+            "kind":        kind,
+            "color":       _node_color(kind, score, cluster),
+            "size":        size,
+        })
 
-    # Build candidate pid → score lookup
-    cand_score = {pid: sc for pid, sc, _ in candidates}
+    for pid in corpus_ids:
+        paper = all_papers.get(pid)
+        if paper:
+            add_node(pid, paper, "corpus")
 
-    # Add nodes + edges
-    for cp_pid, corpus_paper in all_papers.items():
-        if cp_pid not in corpus_ids:
+    for pid, sc, paper in candidates:
+        add_node(pid, all_papers.get(pid, paper), "candidate", sc)
+
+    # ── Edge list ──────────────────────────────────────────────────────────
+    edge_list = []
+    edge_set  = set()
+    for cp_pid in corpus_ids:
+        if cp_pid not in node_idx:
             continue
-        neighbours = (
-            list(corpus_paper.get("references") or []) +
-            list(corpus_paper.get("citations")  or [])
-        )
+        cp_paper = all_papers.get(cp_pid, {})
+        neighbours = (list(cp_paper.get("references") or []) +
+                      list(cp_paper.get("citations")  or []))
         for nb in neighbours:
             if not nb:
                 continue
             npid = nb.get("paperId")
-            if not npid or npid not in candidate_pids:
+            if not npid or npid not in node_idx:
                 continue
-            nb_paper = all_papers.get(npid, nb)
-            sc = cand_score.get(npid, 0.0)
+            key = (min(node_idx[cp_pid], node_idx[npid]),
+                   max(node_idx[cp_pid], node_idx[npid]))
+            if key in edge_set:
+                continue
+            edge_set.add(key)
+            edge_list.append({
+                "s": node_idx[cp_pid],
+                "t": node_idx[npid],
+                "v": cocit_count.get(npid, 1),
+            })
 
-            add_corpus_node(cp_pid, corpus_paper)
-            add_candidate_node(npid, sc, nb_paper)
-
-            cc = cocit_count.get(npid, 1)
-            net.add_edge(cp_pid, npid, value=cc,
-                         color={"color": "#ffffff", "opacity": 0.15 + 0.15 * min(cc / 5, 1)})
-
-    # Add any corpus nodes not yet added (isolated in the graph)
-    for cp_pid, corpus_paper in all_papers.items():
-        if cp_pid in corpus_ids and cp_pid not in added_nodes:
-            add_corpus_node(cp_pid, corpus_paper)
+    graph_data = json.dumps({"nodes": node_list, "edges": edge_list},
+                            ensure_ascii=False)
+    html = _NETWORK_TEMPLATE \
+        .replace("__GRAPH_DATA__", graph_data) \
+        .replace("__N_NODES__",   str(len(node_list))) \
+        .replace("__N_EDGES__",   str(len(edge_list)))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    net.save_graph(str(out_path))
-    print(f"  📡 Network saved → {out_path}  ({len(added_nodes)} nodes)")
+    out_path.write_text(html, encoding="utf-8")
+    print(f"  \U0001f4e1 Network saved \u2192 {out_path}  "
+          f"({len(node_list)} nodes, {len(edge_list)} edges)")
+
+
+# ── cosmos.gl HTML template ────────────────────────────────────────────────────
+_NETWORK_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Co-citation Network</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;background:#1a1a2e;overflow:hidden;
+  font-family:system-ui,-apple-system,sans-serif}
+#graph{width:100vw;height:100vh}
+#ui{position:fixed;top:12px;left:12px;z-index:10;display:flex;gap:8px;align-items:center}
+#search{background:#16213e;color:#fff;border:1px solid #444;border-radius:4px;
+  padding:6px 12px;font-size:13px;width:220px;outline:none}
+#search:focus{border-color:#4cc9f0}
+#stats{color:#aaa;font-size:12px}
+#tip{position:fixed;pointer-events:none;background:rgba(20,22,35,0.92);color:#e0e0e0;
+  border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:10px 14px;
+  font-size:12px;line-height:1.8;max-width:320px;display:none;z-index:20;
+  box-shadow:0 4px 20px rgba(0,0,0,0.6);backdrop-filter:blur(4px)}
+#tip .tip-title{font-size:13px;font-weight:600;color:#fff;margin-bottom:4px;
+  line-height:1.4;display:block}
+#tip .tip-badge{display:inline-block;font-size:10px;font-weight:700;
+  padding:1px 7px;border-radius:10px;margin-bottom:6px;letter-spacing:.5px}
+#tip .tip-row{display:flex;justify-content:space-between;gap:16px;color:#aaa;font-size:11px}
+#tip .tip-row span:last-child{color:#e0e0e0;font-weight:500}
+#legend{position:fixed;bottom:12px;left:12px;color:#aaa;font-size:11px;z-index:10}
+#legend span{display:inline-block;width:10px;height:10px;border-radius:50%;
+  margin-right:4px;vertical-align:middle}
+</style>
+</head>
+<body>
+<div id="ui">
+  <input id="search" type="text" placeholder="Search papers\u2026" autocomplete="off">
+  <span id="stats">__N_NODES__ nodes &middot; __N_EDGES__ edges</span>
+</div>
+<div id="tip"></div>
+<div id="legend">
+  <span style="background:#4cc9f0"></span>Corpus &nbsp;
+  <span style="background:#e63946"></span>High &nbsp;
+  <span style="background:#f4a261"></span>Medium &nbsp;
+  <span style="background:#2a9d8f"></span>Low
+  &nbsp;<span style="color:#555;font-size:10px">scroll=zoom \u2022 drag=pan \u2022 click=DOI</span>
+</div>
+<div id="graph"></div>
+
+<script type="module">
+import { Graph } from 'https://esm.sh/@cosmos.gl/graph@2.6.4';
+
+const RAW   = __GRAPH_DATA__;
+const nodes = RAW.nodes;
+const edges = RAW.edges;
+const N = nodes.length, E = edges.length;
+
+// ── Parse hex color \u2192 RGBA floats ────────────────────────────────────────
+function hexRgba(hex, a) {
+  return [
+    parseInt(hex.slice(1,3),16)/255,
+    parseInt(hex.slice(3,5),16)/255,
+    parseInt(hex.slice(5,7),16)/255,
+    a,
+  ];
+}
+
+// ── Adjacency list for hover-highlight ───────────────────────────────────
+const adj = Array.from({length:N}, ()=>[]);
+edges.forEach(e=>{ adj[e.s].push(e.t); adj[e.t].push(e.s); });
+
+// ── Float32Arrays ─────────────────────────────────────────────────────────
+const positions  = new Float32Array(N * 2);
+const colors     = new Float32Array(N * 4);
+const sizes      = new Float32Array(N);
+const linkArr    = new Float32Array(E * 2);
+const linkColors = new Float32Array(E * 4);
+const linkWidths = new Float32Array(E);
+
+for (let i = 0; i < N; i++) {
+  const a = Math.random() * 2 * Math.PI;
+  const r = Math.sqrt(Math.random());
+  positions[i*2]   = Math.cos(a) * r;
+  positions[i*2+1] = Math.sin(a) * r;
+}
+
+nodes.forEach((n, i) => {
+  const [r,g,b,a] = hexRgba(n.color, 1.0);
+  colors[i*4]=r; colors[i*4+1]=g; colors[i*4+2]=b; colors[i*4+3]=a;
+  sizes[i] = n.size;
+});
+
+edges.forEach((e, i) => {
+  linkArr[i*2]=e.s; linkArr[i*2+1]=e.t;
+  const op = 0.08 + 0.17 * Math.min(e.v / 5, 1);
+  linkColors[i*4]=1; linkColors[i*4+1]=1; linkColors[i*4+2]=1; linkColors[i*4+3]=op;
+  linkWidths[i] = Math.max(0.6, 0.4 + e.v * 0.3);
+});
+
+// ── Tooltip ───────────────────────────────────────────────────────────────
+const tip = document.getElementById('tip');
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function row(label, val) {
+  return '<div class="tip-row"><span>'+label+'</span><span>'+val+'</span></div>';
+}
+function showTip(i) {
+  const n = nodes[i];
+  const isCorpus = n.kind === 'corpus';
+  const badgeColor = isCorpus ? '#4cc9f0' : n.color;
+  const badgeText  = isCorpus ? 'CORPUS' : 'CANDIDATE';
+  const title = n.title.length > 60 ? n.title.slice(0,60)+'\u2026' : n.title;
+  tip.innerHTML =
+    '<span class="tip-title">'+esc(title)+'</span>'
+    + '<span class="tip-badge" style="background:'+badgeColor+'22;color:'+badgeColor+';border:1px solid '+badgeColor+'55">'+badgeText+'</span>'
+    + row('Year',          n.year  || '—')
+    + row('First author',  esc(n.author) || '—')
+    + row('Total citations', (n.citations||0).toLocaleString())
+    + (isCorpus ? '' : row('Co-citations',  n.coCitations || 0))
+    + (isCorpus ? '' : row('Score',         n.score       || '—'));
+  tip.style.display = 'block';
+}
+document.addEventListener('mousemove', e => {
+  if (tip.style.display === 'block') {
+    tip.style.left = Math.min(e.clientX+15, window.innerWidth-360)+'px';
+    tip.style.top  = Math.min(e.clientY+15, window.innerHeight-220)+'px';
+  }
+});
+
+// ── Hover highlight ───────────────────────────────────────────────────────
+// Manual colour update — avoids selectPointsByIndices() which fires
+// onHover(undefined) internally and immediately kills the tooltip.
+let hoveredIdx = -1;
+const origColors = new Float32Array(colors);   // snapshot of initial colours
+const origLinks  = new Float32Array(linkColors);
+
+function applyHighlight(idx) {
+  const visible = new Set([idx]);
+  adj[idx].forEach(nb => { if (nodes[nb].kind === 'corpus') visible.add(nb); });
+
+  for (let i = 0; i < N; i++) {
+    if (visible.has(i)) {
+      colors[i*4]=origColors[i*4]; colors[i*4+1]=origColors[i*4+1];
+      colors[i*4+2]=origColors[i*4+2]; colors[i*4+3]=1.0;
+    } else {
+      colors[i*4]=0.08; colors[i*4+1]=0.08; colors[i*4+2]=0.12; colors[i*4+3]=0.04;
+    }
+  }
+  for (let i = 0; i < E; i++) {
+    const s = linkArr[i*2], t = linkArr[i*2+1];
+    linkColors[i*4+3] = (visible.has(s) && visible.has(t)) ? 0.7 : 0.01;
+  }
+  graph.setPointColors(colors);
+  graph.setLinkColors(linkColors);
+}
+
+function clearHighlight() {
+  colors.set(origColors);
+  linkColors.set(origLinks);
+  graph.setPointColors(colors);
+  graph.setLinkColors(linkColors);
+}
+
+// ── Search ────────────────────────────────────────────────────────────────
+const searchSizes = new Float32Array(sizes);
+document.getElementById('search').addEventListener('input', function() {
+  const term = this.value.toLowerCase().trim();
+  for (let i = 0; i < N; i++) {
+    searchSizes[i] = (!term || nodes[i].title.toLowerCase().includes(term)) ? sizes[i] : 0;
+  }
+  graph.setPointSizes(searchSizes);
+});
+
+// ── Track zoom level for label visibility ─────────────────────────────────
+let   currentK     = 1;
+const LABEL_SHOW_K = 3.0;
+
+// ── Hover handler (called from both config callback and direct listener) ───
+function handleHover(idx) {
+  if (idx === undefined || idx === null) {
+    if (hoveredIdx >= 0) { clearHighlight(); hoveredIdx = -1; }
+    tip.style.display = 'none';
+  } else {
+    if (idx === hoveredIdx) return;   // already handled
+    hoveredIdx = idx;
+    applyHighlight(idx);
+    showTip(idx);
+  }
+}
+
+// ── Create cosmos graph ───────────────────────────────────────────────────
+const graph = new Graph(document.getElementById('graph'), {
+  // Rendering
+  spaceSize:                4096,
+  backgroundColor:          '#1a1a2e',
+  scalePointsOnZoom:        true,
+  pointGreyoutOpacity:      1,      // disable built-in greyout — handled manually
+  linkGreyoutOpacity:       1,      // disable built-in greyout — handled manually
+  renderHoveredPointRing:   true,
+  hoveredPointCursor:       'pointer',
+
+  // Fit view
+  fitViewOnInit:            false,
+
+  // Links
+  linkDefaultWidth:         0.6,
+  linkDefaultColor:         '#5F74C2',
+  linkDefaultArrows:        false,
+
+  // Simulation
+  simulationGravity:        0.1,
+  simulationLinkDistance:   1,
+  simulationLinkSpring:     0.3,
+  simulationRepulsion:      0.4,
+
+  enableDrag:               true,
+  curvedLinks:              false,
+
+  // Track zoom so labels appear only when sufficiently zoomed in
+  onZoom: (event) => {
+    const k = event?.transform?.k;
+    if (k) currentK = k;
+  },
+  onZoomEnd: (event) => {
+    const k = event?.transform?.k;
+    if (k) currentK = k;
+  },
+
+  // Config-based hover callback (may or may not fire depending on cosmos version)
+  onHover: handleHover,
+
+  onClick: (idx) => {
+    if (idx !== undefined && idx !== null) {
+      const doi = nodes[idx].doi;
+      if (doi) window.open('https://doi.org/' + doi, '_blank');
+    }
+  },
+});
+
+// ── Load data and render ──────────────────────────────────────────────────
+graph.setPointPositions(positions);
+graph.setLinks(linkArr);
+graph.setPointColors(colors);
+graph.setPointSizes(sizes);
+graph.setLinkColors(linkColors);
+graph.setLinkWidths(linkWidths);
+graph.render();
+
+// ── Direct mousemove listener as guaranteed hover fallback ────────────────
+// cosmos's config onHover may not fire in all versions; this catches the
+// hover index via getPointIndexByCoordinates (available in cosmos v2.x).
+document.getElementById('graph').addEventListener('mousemove', (e) => {
+  if (typeof graph.getPointIndexByCoordinates === 'function') {
+    const idx = graph.getPointIndexByCoordinates(e.offsetX, e.offsetY);
+    handleHover(idx === -1 ? undefined : idx);
+  }
+});
+document.getElementById('graph').addEventListener('mouseleave', () => {
+  handleHover(undefined);
+});
+
+// ── Canvas label overlay ──────────────────────────────────────────────────
+// Shows persistent labels for corpus + high-score (red) nodes when zoomed in,
+// plus a label for whatever node is currently hovered.
+
+// Identify which nodes get persistent labels: corpus or red (#e63946)
+const labelIndices = [];
+nodes.forEach((n, i) => {
+  if (n.kind === 'corpus' || n.color === '#e63946') labelIndices.push(i);
+});
+graph.trackPointPositionsByIndices(labelIndices);
+
+const labelCanvas = document.createElement('canvas');
+labelCanvas.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:5';
+document.body.appendChild(labelCanvas);
+const ctx2d = labelCanvas.getContext('2d');
+function resizeLabel() {
+  labelCanvas.width  = window.innerWidth;
+  labelCanvas.height = window.innerHeight;
+}
+resizeLabel();
+window.addEventListener('resize', resizeLabel);
+
+function drawOneLabel(graphPos, text, color) {
+  if (!graphPos) return;
+  const [x, y] = graph.spaceToScreenPosition(graphPos);
+  if (x < 0 || y < 0 || x > labelCanvas.width || y > labelCanvas.height) return;
+  ctx2d.shadowColor = 'rgba(0,0,0,0.8)';
+  ctx2d.shadowBlur  = 4;
+  ctx2d.fillStyle   = color;
+  ctx2d.fillText(text, x + 6, y);
+  ctx2d.shadowBlur  = 0;
+}
+
+function drawLabels() {
+  ctx2d.clearRect(0, 0, labelCanvas.width, labelCanvas.height);
+  ctx2d.font        = 'bold 10px system-ui,-apple-system,sans-serif';
+  ctx2d.textBaseline = 'middle';
+
+  // Persistent labels for corpus + red nodes (only when zoomed in enough)
+  if (currentK >= LABEL_SHOW_K) {
+    const posMap = graph.getTrackedPointPositionsMap();
+    if (posMap) {
+      posMap.forEach((graphPos, idx) => {
+        const n = nodes[idx];
+        const color = n.kind === 'corpus' ? '#4cc9f0' : '#ff6b6b';
+        const title = n.title.length > 35 ? n.title.slice(0, 35) + '\u2026' : n.title;
+        drawOneLabel(graphPos, title, color);
+      });
+    }
+  }
+
+  // Hovered node label — always visible regardless of zoom
+  if (hoveredIdx >= 0) {
+    const posMap = graph.getTrackedPointPositionsMap();
+    // getTrackedPointPositionsMap only has labelIndices; for other nodes
+    // fall back to the tooltip position which is always available
+    const n = nodes[hoveredIdx];
+    const title = n.title.length > 40 ? n.title.slice(0, 40) + '\u2026' : n.title;
+    const cc    = n.coCitations ? ` · ${n.coCitations} co-cit.` : '';
+    const text  = title + cc;
+
+    // Try tracked position first; otherwise draw near tooltip
+    const trackedPos = posMap && posMap.get(hoveredIdx);
+    if (trackedPos) {
+      ctx2d.font = 'bold 11px system-ui,-apple-system,sans-serif';
+      drawOneLabel(trackedPos, text, '#ffffff');
+      ctx2d.font = 'bold 10px system-ui,-apple-system,sans-serif';
+    } else {
+      // Draw near the tooltip element
+      const tl = tip.style.left ? parseInt(tip.style.left) : -1;
+      const tt = tip.style.top  ? parseInt(tip.style.top)  : -1;
+      if (tl > 0 && tt > 0) {
+        ctx2d.shadowColor = 'rgba(0,0,0,0.9)';
+        ctx2d.shadowBlur  = 5;
+        ctx2d.fillStyle   = '#ffffff';
+        ctx2d.font        = 'bold 11px system-ui,-apple-system,sans-serif';
+        ctx2d.fillText(text, tl, tt - 14);
+        ctx2d.shadowBlur  = 0;
+        ctx2d.font        = 'bold 10px system-ui,-apple-system,sans-serif';
+      }
+    }
+  }
+
+  requestAnimationFrame(drawLabels);
+}
+requestAnimationFrame(drawLabels);
+</script>
+</body></html>"""
 
 # ── Visualization 2: Interactive timeline scatter (HTML via Plotly) ────────────
 def make_timeline(corpus_ids, cocit_count, all_papers, candidates, out_path):
