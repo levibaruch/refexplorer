@@ -74,17 +74,24 @@ def _bib_field(pattern, entry):
     # Strip any remaining inner braces used for capitalisation, e.g. {R}eplication
     return re.sub(r'\{([^}]*)\}', r'\1', raw).strip()
 
+def normalize_doi(raw_doi):
+    if not raw_doi:
+        return None
+    doi = raw_doi.strip()
+    doi = re.sub(r'(?i)^doi:\s*', '', doi)
+    doi = re.sub(r'(?i)^https?://(dx\.)?doi\.org/', '', doi)
+    doi = doi.strip().rstrip(".,)")
+    if not doi.startswith("10."):
+        return None
+    return doi
+
 def parse_bib(bib_path):
     text = Path(bib_path).read_text(encoding="utf-8", errors="ignore")
     papers = []
     for entry in re.split(r'(?=@\w+\{)', text):
         title = _bib_field("title", entry) or ""
         year  = _bib_field("year",  entry) or ""
-        doi   = _bib_field("doi",   entry)
-        if doi:
-            doi = doi.replace("https://doi.org/", "").strip().rstrip(".,)")
-            if not doi.startswith("10."):
-                doi = None
+        doi   = normalize_doi(_bib_field("doi", entry))
         papers.append({"title": title, "doi": doi, "year": year})
     return [p for p in papers if p["title"] or p["doi"]]
 
@@ -136,6 +143,31 @@ def title_similarity(a, b):
     if not wa or not wb:
         return 0.0
     return len(wa & wb) / min(len(wa), len(wb))
+
+def ss_search_by_title(title):
+    if not title:
+        return None
+
+    data = ss_get(f"{SS_BASE}/search", {"query": title, "fields": SS_FIELDS, "limit": 5})
+    if not data or not data.get("data"):
+        return None
+
+    best_match = None
+    best_score = 0.0
+    for candidate in data["data"]:
+        candidate_title = candidate.get("title") or ""
+        score = title_similarity(title, candidate_title)
+        if score > best_score:
+            best_match = candidate
+            best_score = score
+
+    if best_score < 0.6:
+        if best_match:
+            best_title = best_match.get("title") or "?"
+            print(f"    ✗ SS title mismatch: '{best_title[:55]}' (score {best_score:.2f}) — skipping")
+        return None
+
+    return best_match
 
 def oa_lookup(title=None, doi=None):
     """OpenAlex fallback — returns SS-shaped dict (no graph data) or None."""
@@ -215,11 +247,9 @@ def resolve_all(corpus, cache, cache_path):
             api_calls += 1
             time.sleep(SLEEP)
         if not result and title:
-            data = ss_get(f"{SS_BASE}/search", {"query": title, "fields": SS_FIELDS, "limit": 1})
+            result = ss_search_by_title(title)
             api_calls += 1
             time.sleep(SLEEP)
-            if data and data.get("data"):
-                result = data["data"][0]
 
         # OpenAlex fallback (corpus identity only — no graph data)
         if not result:
