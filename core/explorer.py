@@ -212,10 +212,139 @@ def _oa_to_ss(oa):
         "abstract":      oa.get("abstract", ""),
         "fieldsOfStudy": concepts,
         "externalIds":   {"DOI": doi},
-        "references":    [],  # OA doesn't expose full reference lists cheaply
+        "references":    [],
         "citations":     [],
         "_source":       "openalex",
     }
+
+OA_SELECT_FIELDS = ("id,doi,display_name,publication_year,cited_by_count,"
+                     "authorships,concepts")
+
+def _oa_resolve_id(title=None, doi=None):
+    """Resolve a paper to its OpenAlex ID. Returns the bare ID or None."""
+    if doi:
+        r = requests.get(f"{OA_BASE}/https://doi.org/{doi}",
+                         params={"mailto": "literature-explorer",
+                                 "select": "id"},
+                         timeout=15)
+        if r.ok:
+            return r.json().get("id", "").replace("https://openalex.org/", "")
+    if title:
+        r = requests.get(OA_BASE, params={"search": title, "per_page": 1,
+                         "select": "id,display_name",
+                         "mailto": "literature-explorer"}, timeout=15)
+        if r.ok and r.json().get("results"):
+            candidate = r.json()["results"][0]
+            if title_similarity(title, candidate.get("display_name", "")) >= 0.3:
+                return candidate.get("id", "").replace("https://openalex.org/", "")
+    return None
+
+def _oa_parse_work(w):
+    """Convert an OpenAlex work dict to an SS-shaped reference/citation dict."""
+    ref_doi = (w.get("doi") or "").replace("https://doi.org/", "")
+    authors = [{"name": a.get("display_name", "?")}
+               for a in (w.get("authorships") or [])[:5]]
+    fields = [c.get("display_name", "")
+              for c in (w.get("concepts") or [])[:5]]
+    return {
+        "paperId": w.get("id", "").replace("https://openalex.org/", ""),
+        "title": w.get("display_name", ""),
+        "year": w.get("publication_year"),
+        "citationCount": w.get("cited_by_count", 0),
+        "authors": authors,
+        "externalIds": {"DOI": ref_doi} if ref_doi else {},
+        "fieldsOfStudy": fields,
+    }
+
+def oa_fetch_references(title=None, doi=None):
+    """
+    Fetch referenced_works from OpenAlex for a paper, then batch-resolve
+    those work IDs into SS-shaped metadata dicts.
+    The referenced_works list is always complete (no truncation).
+    Returns a list of reference dicts (may be empty).
+    """
+    try:
+        # Get the work with its referenced_works list
+        oa_work = None
+        if doi:
+            r = requests.get(f"{OA_BASE}/https://doi.org/{doi}",
+                             params={"mailto": "literature-explorer",
+                                     "select": "id,referenced_works"},
+                             timeout=15)
+            if r.ok:
+                oa_work = r.json()
+        if not oa_work and title:
+            r = requests.get(OA_BASE, params={"search": title, "per_page": 1,
+                             "select": "id,display_name,referenced_works",
+                             "mailto": "literature-explorer"}, timeout=15)
+            if r.ok and r.json().get("results"):
+                candidate = r.json()["results"][0]
+                if title_similarity(title, candidate.get("display_name", "")) >= 0.3:
+                    oa_work = candidate
+        if not oa_work:
+            return []
+
+        ref_ids = oa_work.get("referenced_works") or []
+        if not ref_ids:
+            return []
+
+        # Batch-resolve OA work IDs into metadata (up to 200 per request)
+        refs = []
+        for batch_start in range(0, len(ref_ids), 200):
+            batch = ref_ids[batch_start:batch_start + 200]
+            oa_ids = "|".join(w.replace("https://openalex.org/", "") for w in batch)
+            r = requests.get(OA_BASE, params={
+                "filter": f"openalex:{oa_ids}",
+                "per_page": 200,
+                "select": OA_SELECT_FIELDS,
+                "mailto": "literature-explorer",
+            }, timeout=20)
+            if not r.ok:
+                continue
+            for w in r.json().get("results", []):
+                refs.append(_oa_parse_work(w))
+            time.sleep(0.5)
+        return refs
+    except Exception as e:
+        print(f"    ⚠  OA reference fetch error: {e}")
+        return []
+
+def oa_fetch_citations(title=None, doi=None, limit=10000):
+    """
+    Fetch works that cite this paper from OpenAlex via the 'cites' filter.
+    Uses cursor pagination (no ceiling) instead of page-based (capped at 10K).
+    Returns a list of SS-shaped citation dicts (may be empty).
+    """
+    try:
+        oa_id = _oa_resolve_id(title=title, doi=doi)
+        if not oa_id:
+            return []
+
+        cits = []
+        cursor = "*"
+        while len(cits) < limit and cursor:
+            per_page = min(200, limit - len(cits))
+            r = requests.get(OA_BASE, params={
+                "filter": f"cites:{oa_id}",
+                "per_page": per_page,
+                "cursor": cursor,
+                "select": OA_SELECT_FIELDS,
+                "mailto": "literature-explorer",
+            }, timeout=20)
+            if not r.ok:
+                break
+            data = r.json()
+            results = data.get("results", [])
+            if not results:
+                break
+            for w in results:
+                cits.append(_oa_parse_work(w))
+            cursor = data.get("meta", {}).get("next_cursor")
+            time.sleep(0.5)
+        return cits
+    except Exception as e:
+        print(f"    ⚠  OA citation fetch error: {e}")
+        return []
 
 # ── Step 3: Resolve corpus (metadata + refs + citations in ONE call each) ──────
 def resolve_all(corpus, cache, cache_path):
@@ -259,38 +388,114 @@ def resolve_all(corpus, cache, cache_path):
             api_calls += 1
             time.sleep(SLEEP)
 
-        # OpenAlex fallback (corpus identity only — no graph data)
+        # OpenAlex fallback (corpus identity + references via referenced_works)
         if not result:
             print(f"  [{i+1}/{total}] ⚠  SS failed → trying OpenAlex...")
             result = oa_lookup(title=title, doi=doi)
             if result:
-                print(f"    ✓ (OA, no graph) {result.get('title','?')[:60]}")
+                # Also fetch references and citations from OA since SS is unavailable
+                oa_refs = oa_fetch_references(title=title, doi=doi)
+                oa_cits = oa_fetch_citations(title=title, doi=doi)
+                if oa_refs:
+                    result["references"] = oa_refs
+                if oa_cits:
+                    result["citations"] = oa_cits
+                parts = []
+                if oa_refs: parts.append(f"{len(oa_refs)} refs")
+                if oa_cits: parts.append(f"{len(oa_cits)} cits")
+                suffix = f" + {', '.join(parts)}" if parts else ", no graph"
+                print(f"    ✓ (OA{suffix}) {result.get('title','?')[:60]}")
             else:
                 print(f"  [{i+1}/{total}] ✗  Unresolvable: {label}")
                 failed.append(paper)
                 continue
 
-        # If SS returned 0 references, try the dedicated /references endpoint.
-        # This happens for some papers where the inline field is restricted.
-        if not result.get("_source") and not result.get("references"):
+        # If SS returned 0 or exactly 1000 references (truncated), try the
+        # dedicated /references endpoint which supports offset pagination.
+        ss_refs = result.get("references") or []
+        if not result.get("_source") and (not ss_refs or len(ss_refs) == 1000):
             pid_ss = result.get("paperId")
             if pid_ss:
                 ref_fields = ("paperId,title,year,citationCount,"
                               "authors,externalIds,fieldsOfStudy")
-                ref_data = ss_get(
-                    f"{SS_BASE}/{pid_ss}/references",
-                    {"fields": ref_fields, "limit": 500},
-                )
-                api_calls += 1
-                time.sleep(SLEEP)
-                if ref_data and ref_data.get("data"):
-                    result["references"] = [
-                        r["citedPaper"] for r in ref_data["data"]
-                        if r.get("citedPaper")
-                    ]
-                    print(f"    ↳ fetched {len(result['references'])} refs via /references endpoint")
-                else:
+                all_refs = []
+                offset = 0
+                while True:
+                    ref_data = ss_get(
+                        f"{SS_BASE}/{pid_ss}/references",
+                        {"fields": ref_fields, "limit": 1000, "offset": offset},
+                    )
+                    api_calls += 1
+                    time.sleep(SLEEP)
+                    if not ref_data or not ref_data.get("data"):
+                        break
+                    batch = [r["citedPaper"] for r in ref_data["data"] if r.get("citedPaper")]
+                    all_refs.extend(batch)
+                    if len(ref_data["data"]) < 1000:
+                        break
+                    offset += 1000
+                if all_refs and len(all_refs) >= len(ss_refs):
+                    result["references"] = all_refs
+                    print(f"    ↳ fetched {len(all_refs)} refs via /references endpoint")
+                elif not ss_refs:
                     print(f"    ↳ /references endpoint returned nothing — SS has no ref data for this paper")
+
+        # Try OpenAlex referenced_works as additive fallback (empty or truncated)
+        cur_refs = result.get("references") or []
+        if not cur_refs or len(cur_refs) % 1000 == 0:
+            doi_for_oa = (result.get("externalIds") or {}).get("DOI") or doi
+            title_for_oa = result.get("title") or title
+            oa_refs = oa_fetch_references(title=title_for_oa, doi=doi_for_oa)
+            if oa_refs:
+                # Additive: merge OA refs with any existing refs (preserving originals)
+                existing_ids = {r.get("paperId") for r in (result.get("references") or []) if r.get("paperId")}
+                new_refs = [r for r in oa_refs if r.get("paperId") and r["paperId"] not in existing_ids]
+                if result.get("references") is None:
+                    result["references"] = []
+                result["references"].extend(new_refs)
+                print(f"    ↳ added {len(new_refs)} refs via OpenAlex referenced_works")
+
+        # If SS returned 0 or exactly 1000 citations (truncated), try the
+        # dedicated /citations endpoint which supports offset pagination.
+        ss_cits = result.get("citations") or []
+        if not result.get("_source") and (not ss_cits or len(ss_cits) == 1000):
+            pid_ss = result.get("paperId")
+            if pid_ss:
+                cit_fields = ("paperId,title,year,citationCount,"
+                              "authors,externalIds,fieldsOfStudy")
+                all_cits = []
+                offset = 0
+                while True:
+                    cit_data = ss_get(
+                        f"{SS_BASE}/{pid_ss}/citations",
+                        {"fields": cit_fields, "limit": 1000, "offset": offset},
+                    )
+                    api_calls += 1
+                    time.sleep(SLEEP)
+                    if not cit_data or not cit_data.get("data"):
+                        break
+                    batch = [c["citingPaper"] for c in cit_data["data"] if c.get("citingPaper")]
+                    all_cits.extend(batch)
+                    if len(cit_data["data"]) < 1000:
+                        break
+                    offset += 1000
+                if all_cits and len(all_cits) >= len(ss_cits):
+                    result["citations"] = all_cits
+                    print(f"    ↳ fetched {len(all_cits)} cits via /citations endpoint")
+
+        # Try OpenAlex citing works as additive fallback (empty or truncated)
+        cur_cits = result.get("citations") or []
+        if not cur_cits or len(cur_cits) % 1000 == 0:
+            doi_for_oa = (result.get("externalIds") or {}).get("DOI") or doi
+            title_for_oa = result.get("title") or title
+            oa_cits = oa_fetch_citations(title=title_for_oa, doi=doi_for_oa)
+            if oa_cits:
+                existing_ids = {c.get("paperId") for c in (result.get("citations") or []) if c.get("paperId")}
+                new_cits = [c for c in oa_cits if c.get("paperId") and c["paperId"] not in existing_ids]
+                if result.get("citations") is None:
+                    result["citations"] = []
+                result["citations"].extend(new_cits)
+                print(f"    ↳ added {len(new_cits)} citations via OpenAlex cites filter")
 
         # Extract venue from publicationVenue (preferred) or venue field
         result["venue"] = (
@@ -331,9 +536,6 @@ def build_cocitation_graph(resolved_corpus, corpus_ids):
     candidate_meta    = {}
 
     for paper in resolved_corpus:
-        if paper.get("_source") == "openalex":
-            continue  # no graph data on OA records
-
         for ref in (paper.get("references") or []):
             pid = ref.get("paperId")
             if pid and pid not in corpus_ids and ref.get("title"):
