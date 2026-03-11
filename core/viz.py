@@ -418,6 +418,39 @@ function handleHover(idx) {
   }
 }
 
+// ── Adaptive physics parameters based on node count ─────────────────────
+// Small graphs (< 500 nodes) need stronger repulsion to spread out;
+// large graphs benefit from weaker repulsion to let natural density patterns emerge.
+function getPhysicsParams(nodeCount) {
+  let repulsion, linkSpring, linkDistance;
+
+  if (nodeCount < 300) {
+    // Very small: aggressive spreading
+    repulsion = 1.0;
+    linkSpring = 0.15;
+    linkDistance = 2;
+  } else if (nodeCount < 1000) {
+    // Small to medium: moderate spreading
+    repulsion = 0.7;
+    linkSpring = 0.22;
+    linkDistance = 1.5;
+  } else if (nodeCount < 5000) {
+    // Medium: balanced
+    repulsion = 0.5;
+    linkSpring = 0.27;
+    linkDistance = 1.2;
+  } else {
+    // Large: let density patterns form naturally
+    repulsion = 0.4;
+    linkSpring = 0.3;
+    linkDistance = 1;
+  }
+
+  return { repulsion, linkSpring, linkDistance };
+}
+
+const physicsParams = getPhysicsParams(N);
+
 // ── Create cosmos graph ───────────────────────────────────────────────────
 const graph = new Graph(document.getElementById('graph'), {
   // Rendering
@@ -437,11 +470,11 @@ const graph = new Graph(document.getElementById('graph'), {
   linkDefaultColor:         '#5F74C2',
   linkDefaultArrows:        false,
 
-  // Simulation
+  // Simulation (adaptive based on node count)
   simulationGravity:        0.1,
-  simulationLinkDistance:   1,
-  simulationLinkSpring:     0.3,
-  simulationRepulsion:      0.4,
+  simulationLinkDistance:   physicsParams.linkDistance,
+  simulationLinkSpring:     physicsParams.linkSpring,
+  simulationRepulsion:      physicsParams.repulsion,
 
   enableDrag:               true,
   curvedLinks:              false,
